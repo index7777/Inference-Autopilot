@@ -27,6 +27,16 @@ class SmokeTests(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_provider_adapter_detection(self):
+        openai={"id":"o1","provider":"openai","model":"gpt-6-sol","timestamp":"2026-09-27T00:00:00Z","usage":{"prompt_tokens":10,"completion_tokens":2},"messages":[{"role":"user","content":"hi"}]}
+        anthropic={"id":"a1","provider":"anthropic","model":"claude-sonnet-5","timestamp":"2026-09-27T00:00:00Z","usage":{"input_tokens":10,"output_tokens":2},"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","messages":[{"role":"user","content":"hi"}]}
+        openrouter={"id":"r1","provider":"openrouter","model":"vendor/model","timestamp":"2026-09-27T00:00:00Z","usage":{"prompt_tokens":10,"completion_tokens":2},"cost":0.01,"messages":[{"role":"user","content":"hi"}]}
+        self.assertEqual(choose_adapter(openai)[0].name,"openai")
+        self.assertEqual(choose_adapter(anthropic)[0].name,"anthropic")
+        self.assertEqual(choose_adapter(openrouter)[0].name,"openrouter")
+        normalized=self.rows[0]
+        self.assertEqual(choose_adapter(normalized)[0].name,"normalized")
+
     def test_demo_produces_findings_and_known_cost(self):
         self.assertEqual(len(self.rows), 5)
         profile = build_profile(self.rows)
@@ -48,8 +58,7 @@ class SmokeTests(unittest.TestCase):
         row["usage"]["output_tokens"] = 3
         row["request"]["temperature"] = 0
         findings = run_detectors([row], build_profile([row]))
-        simple = [x for x in findings if x["detector"] == "simple-task"]
-        self.assertEqual(simple, [])
+        self.assertEqual([x for x in findings if x["detector"] == "simple-task"], [])
 
     def test_schema_validation_rejects_missing_critical_fields(self):
         bad = {"schema_version":"0.1","request_id":"x"}

@@ -8,6 +8,7 @@ from inference_autopilot.pricing.catalog import load_catalog, apply_cost
 from inference_autopilot.engine import build_profile, run_detectors, public_profile
 from inference_autopilot.privacy.redact import redact_obj
 from inference_autopilot.report.html import write_html
+from inference_autopilot.schema import validate_normalized_record
 
 
 class SmokeTests(unittest.TestCase):
@@ -19,7 +20,7 @@ class SmokeTests(unittest.TestCase):
             try:
                 adapter, _ = choose_adapter(raw)
                 row = redact_obj(adapter.normalize(raw))
-                if not row.get("request_id") or not row.get("model"):
+                if validate_normalized_record(row):
                     continue
                 apply_cost(row, load_catalog())
                 self.rows.append(row)
@@ -38,6 +39,23 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("cacheable", names)
         self.assertIn("simple-task", names)
         self.assertIn("downgrade-candidate", names)
+
+    def test_short_low_temperature_reasoning_is_not_simple_task_by_itself(self):
+        row = json.loads(json.dumps(self.rows[0]))
+        row["request_id"] = "hard-short"
+        row["request"]["messages"] = [{"role":"user","content":"Prove whether this algebraic statement is true and give only the final value."}]
+        row["response"]["content"] = "42"
+        row["usage"]["output_tokens"] = 3
+        row["request"]["temperature"] = 0
+        findings = run_detectors([row], build_profile([row]))
+        simple = [x for x in findings if x["detector"] == "simple-task"]
+        self.assertEqual(simple, [])
+
+    def test_schema_validation_rejects_missing_critical_fields(self):
+        bad = {"schema_version":"0.1","request_id":"x"}
+        errors = validate_normalized_record(bad)
+        self.assertTrue(any("timestamp" in x for x in errors))
+        self.assertTrue(any("provider" in x for x in errors))
 
     def test_html_report_is_self_contained(self):
         profile = build_profile(self.rows)

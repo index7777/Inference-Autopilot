@@ -1,5 +1,5 @@
 from __future__ import annotations
-import hashlib
+import hashlib, json
 from collections import Counter, defaultdict
 from inference_autopilot.pricing.catalog import effective_cost
 
@@ -9,25 +9,30 @@ def _messages_text(msgs): return "\n".join(str(m.get("content","")) for m in msg
 def _sum_cost(rows): return sum(float(effective_cost(r) or 0) for r in rows)
 
 def build_profile(records):
-    providers=Counter(); models=Counter(); lat=[]; known=[]; success=0; systems=defaultdict(list); exact=defaultdict(list)
+    providers=Counter(); models=Counter(); lat=[]; known=[]; success=0
+    systems=defaultdict(list); exact=defaultdict(list); prefixes=defaultdict(list); tools=defaultdict(list)
     for r in records:
         providers[r["provider"]]+=1; models[f'{r["provider"]}/{r["model"]}']+=1
         c=effective_cost(r)
         if c is not None: known.append(float(c))
         if r.get("latency_ms") is not None: lat.append(float(r["latency_ms"]))
         success += r.get("status")=="success"
-        msgs=(r.get("request") or {}).get("messages") or []
+        req=r.get("request") or {}; msgs=req.get("messages") or []
         sys="\n".join(str(m.get("content","")) for m in msgs if isinstance(m,dict) and m.get("role")=="system")
         full=_messages_text(msgs)
+        prefix=_norm(full)[:1200]
+        tool_blob=json.dumps(req.get("tools") or [],sort_keys=True,separators=(",",":"),ensure_ascii=False)
         if sys: systems[_fp(sys)].append(r)
         if full: exact[_fp(full)].append(r)
+        if len(prefix)>=200: prefixes[_fp(prefix)].append(r)
+        if tool_blob != "[]": tools[_fp(tool_blob)].append(r)
     sl=sorted(lat)
     pct=lambda p: sl[min(len(sl)-1,int((len(sl)-1)*p))] if sl else None
     spend=sum(known)
     return {"request_count":len(records),"providers":dict(providers),"models":dict(models),"known_cost_usd":round(spend,6),
             "monthly_run_rate_usd":round(spend*30,2),"pricing_coverage_pct":round(len(known)/len(records)*100,1) if records else 0,
             "success_rate_pct":round(success/len(records)*100,1) if records else 0,"p50_latency_ms":pct(.5),"p95_latency_ms":pct(.95),
-            "_system_groups":systems,"_request_groups":exact}
+            "_system_groups":systems,"_request_groups":exact,"_prefix_groups":prefixes,"_tool_groups":tools}
 
 def _opp(id,detector,title,confidence,rows,evidence,assumptions,next_step,savings=None,factors=None):
     cost=_sum_cost(rows)
@@ -37,26 +42,43 @@ def _opp(id,detector,title,confidence,rows,evidence,assumptions,next_step,saving
             "next_step":next_step,"request_ids":[r["request_id"] for r in rows[:50]],"score_factors":factors}
 
 def duplicate_context(profile):
-    out=[]
-    for i,rows in enumerate(profile["_system_groups"].values(),1):
+    out=[]; idx=0
+    for rows in profile["_system_groups"].values():
         if len(rows)<3: continue
         text="\n".join(str(m.get("content","")) for m in rows[0]["request"].get("messages",[]) if m.get("role")=="system")
         if len(text)<120: continue
-        cost=_sum_cost(rows)
-        out.append(_opp(f"dup-{i}","duplicate-context","Repeated system context appears across many requests","high",rows,
+        idx+=1; cost=_sum_cost(rows)
+        out.append(_opp(f"dup-{idx}","duplicate-context","Repeated system context appears across many requests","high",rows,
             [f"Same system-message fingerprint appears in {len(rows)} requests",f"Repeated system content length is {len(text)} characters"],
             ["Savings estimate conservatively attributes 20% of affected request cost until token-level prefix attribution is available"],
             "Evaluate provider prompt caching or application-side context reuse",cost*.20 if cost else None))
+    for rows in profile["_tool_groups"].values():
+        if len(rows)<3: continue
+        idx+=1; cost=_sum_cost(rows)
+        out.append(_opp(f"dup-{idx}","duplicate-context","Repeated tool/schema block appears across many requests","high",rows,
+            [f"Identical serialized tool/schema block appears in {len(rows)} requests"],
+            ["Repeated tool definitions may be required semantically; the recommendation is caching/reuse, not removal"],
+            "Measure provider prompt-cache eligibility for static tool/schema definitions",cost*.10 if cost else None))
     return out
 
 def cacheable(profile):
-    out=[]
-    for i,rows in enumerate(profile["_request_groups"].values(),1):
+    out=[]; idx=0
+    for rows in profile["_request_groups"].values():
         if len(rows)<3: continue
-        cost=_sum_cost(rows)
-        out.append(_opp(f"cache-{i}","cacheable","Exact repeated request cluster is a strong caching candidate","high",rows,
+        idx+=1; cost=_sum_cost(rows)
+        out.append(_opp(f"cache-{idx}","cacheable","Exact repeated request cluster is a strong caching candidate","high",rows,
             [f"Exact normalized request fingerprint repeats {len(rows)} times"],["Savings estimate assumes repeated work can be reused or served from a cheaper cache path"],
             "Test provider prompt caching or an application response cache",cost*.50 if cost else None))
+    for rows in profile["_prefix_groups"].values():
+        if len(rows)<3: continue
+        ids={r["request_id"] for r in rows}
+        if any(ids.issubset(set(o.get("request_ids") or [])) for o in out):
+            continue
+        idx+=1; cost=_sum_cost(rows)
+        out.append(_opp(f"cache-{idx}","cacheable","Long repeated request prefix is a prompt-cache candidate","high",rows,
+            [f"Same normalized prefix fingerprint appears in {len(rows)} requests"],
+            ["Prefix similarity does not imply response reuse; estimate assumes only the repeated prefix is cacheable"],
+            "Measure cached-input pricing and cache-hit behavior for this prefix",cost*.15 if cost else None))
     return out
 
 def _shape(r):
@@ -71,12 +93,13 @@ def simple_and_downgrade(records):
     rows=[]
     for r in records:
         s,f=_shape(r)
-        if s>=.5: rows.append((r,s,f))
+        strong_signal=bool(f["constrained_prompt"] or f["structured_output"])
+        if s>=.5 and strong_signal: rows.append((r,s,f))
     out=[]
     if rows:
         rs=[x[0] for x in rows]; avg=sum(x[1] for x in rows)/len(rows)
         out.append(_opp("simple-1","simple-task","Traffic structurally resembles constrained decision work","medium",rs,
-            [f"{len(rs)} requests match at least two constrained-task signals",f"Average structural simplicity is {avg:.2f}"],
+            [f"{len(rs)} requests match at least two constrained-task signals and at least one strong constrained/structured signal",f"Average structural simplicity is {avg:.2f}"],
             ["This identifies replay candidates only; it does not prove a smaller model preserves quality"],
             "Replay a representative sample against a cheaper model or deterministic implementation",None,{"structural_simplicity":round(avg,3)}))
         priced=[x for x in rows if effective_cost(x[0]) is not None]
